@@ -218,15 +218,20 @@ def insert_job(job_data: Dict[str, Any]) -> Tuple[Optional[int], bool]:
         conn.close()
         return row["id"], False
 
-    # 2. Çapraz kaynak tekilleştirme kontrolü (Aynı ilan başka kaynaktan gelmiş mi?)
-    sig = generate_job_signature(job_data.get("title", ""), job_data.get("institution", ""))
-    if sig:
-        cursor.execute("SELECT id, source, url FROM jobs WHERE signature = ? AND signature != ''", (sig,))
-        existing_sig = cursor.fetchone()
-        if existing_sig:
-            # Aynı ilan farklı bir kaynaktan zaten mevcut! Mükerrer ekleme
-            conn.close()
-            return existing_sig["id"], False
+    tags_list = job_data.get("tags") or []
+    is_uygun_degil = "UYGUN_DEGIL" in tags_list
+
+    # 2. Çapraz kaynak tekilleştirme kontrolü (Yalnızca geçerli ilanlar için yapılır, elenen ilanların URL'leri kaydedilmelidir)
+    sig = ""
+    if not is_uygun_degil:
+        sig = generate_job_signature(job_data.get("title", ""), job_data.get("institution", ""))
+        if sig:
+            cursor.execute("SELECT id, source, url FROM jobs WHERE signature = ? AND signature != ''", (sig,))
+            existing_sig = cursor.fetchone()
+            if existing_sig:
+                # Aynı ilan farklı bir kaynaktan zaten mevcut! Mükerrer ekleme
+                conn.close()
+                return existing_sig["id"], False
 
     tags_json = json.dumps(job_data.get("tags", []), ensure_ascii=False)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

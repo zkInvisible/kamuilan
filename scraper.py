@@ -946,13 +946,23 @@ def _validate_rg_pdf(pdf_url: str) -> Tuple[bool, str]:
         # Resmi Gazete üst bilgi şeridini (header) temizleyerek gövde metnini kontrol et
         cleaned_text = re.sub(r"\d{2}\.\d{2}\.\d{4}.*?çeşitli\s*ilanlar.*?(?:\d+/\d+-\d+|\b)", "", text, flags=re.IGNORECASE).strip()
 
-        # Dijital gövde metni yetersizse (taranmış resim ilanı ise) OCR dene
+        # Dijital gövde metni yetersizse (taranmış resim ilanı ise) başlık alanına ultra-hızlı OCR uygula
         if (len(cleaned_text) < 80 or len(text.strip()) < 150) and _ocr_engine and reader.pages[0].images:
             try:
+                from PIL import Image
                 img_data = reader.pages[0].images[0].data
-                result, _ = _ocr_engine(img_data)
-                if result:
-                    text = " ".join([line[1] for line in result])
+                with Image.open(io.BytesIO(img_data)) as im:
+                    # İlan başlığı ve türü her zaman ilk %35'lik alandadır; tam A4 OCR yapmak yerine sadece başlığı oku
+                    w, h = im.size
+                    header_crop = im.crop((0, 0, w, int(h * 0.35)))
+                    if header_crop.width > 900:
+                        ratio = 900.0 / header_crop.width
+                        header_crop = header_crop.resize((900, int(header_crop.height * ratio)), Image.Resampling.BILINEAR)
+                    buf = io.BytesIO()
+                    header_crop.convert("RGB").save(buf, format="JPEG", quality=75)
+                    result, _ = _ocr_engine(buf.getvalue())
+                    if result:
+                        text = " ".join([line[1] for line in result])
             except Exception:
                 pass
 
@@ -980,8 +990,9 @@ def scrape_resmi_gazete(existing_urls: set = None) -> List[Dict[str, Any]]:
     jobs = []
     
     today = datetime.now()
-    # Son 3 günü kontrol et (hafta sonu vs. için)
-    dates_to_check = [today - timedelta(days=i) for i in range(3)]
+    # Pazartesi ise hafta sonu dahil 3 gün, diğer günler son 2 gün
+    days_cnt = 3 if today.weekday() == 0 else 2
+    dates_to_check = [today - timedelta(days=i) for i in range(days_cnt)]
     
     # Türkçe kurum eki temizleme desenleri
     suffix_patterns = [
@@ -1034,15 +1045,55 @@ def scrape_resmi_gazete(existing_urls: set = None) -> List[Dict[str, Any]]:
                     if existing_urls and (pdf_url in existing_urls or unquoted_pdf in existing_urls):
                         continue
 
-                    # Başlık bazlı hızlı eleme (ihale, iflas, kamulaştırma, tasfiye vs.)
+                    clean_name = p_text.rstrip(": ")
+                    inst_part = clean_name.split(':')[0].strip()
+                    for sp in suffix_patterns:
+                        inst_part = re.sub(sp, "", inst_part, flags=re.IGNORECASE).strip()
+
+                    # Başlık bazlı hızlı eleme (ihale, akademik, düzeltme vs. - PDF indirmeden anında atla)
                     p_low = p_text.lower()
-                    if any(skip_w in p_low for skip_w in ["ihale", "iflas", "kamulaştırma", "tasfiye", "zayi", "fesih", "kayıp", "ruhsat", "bilirkişi", "ceza"]):
+                    p_norm = normalize_for_search(p_text)
+                    skip_words = [
+                        "ihale", "iflas", "kamulastirma", "tasfiye", "zayi", "fesih", "kayip", "ruhsat", "bilirkisi", "ceza",
+                        "kamulaştırma", "kayıp", "bilirkişi",
+                        # Akademik kadrolar (prof/doç/öğretim elemanı/üyesi/araştırma görevlisi vb.)
+                        "ogretim uyesi", "öğretim üyesi", "ogretim elemani", "öğretim elemanı", "ogretim gorevli", "öğretim görevli",
+                        "arastirma gorevli", "araştırma görevli", "docent", "doçent", "profesor", "profesör", "dr. ogr", "dr. öğr",
+                        # Düzeltme / Sehiv / İptal
+                        "duzeltme", "düzeltme", "sehiv", "iptal",
+                        # Tıp / Hemşire kadroları
+                        "hemsire", "hemşire", "tabip", "doktor alim", "doktor alım", "uzman tabip"
+                    ]
+                    if any(sw in p_low or sw in p_norm for sw in skip_words):
+                        jobs.append({
+                            "title": f"{inst_part}: Elenen / İdari / Akademik İlan",
+                            "institution": inst_part,
+                            "url": pdf_url,
+                            "source": "Resmi Gazete",
+                            "summary": f"Resmî Gazete İlanı (Filtrelendi): {p_text}",
+                            "tags": ["UYGUN_DEGIL"],
+                            "published_date": d.strftime("%d.%m.%Y"),
+                            "requires_experience": 0,
+                            "experience_note": ""
+                        })
                         continue
 
                     # PDF içerik doğrulaması
-                    is_valid, _ = _validate_rg_pdf(pdf_url)
+                    is_valid, rej_reason = _validate_rg_pdf(pdf_url)
                     if not is_valid:
                         logger.info(f"RG filtre: Elenen ilan → {p_text[:50]}")
+                        # Elenen ilanı da DB'ye UYGUN_DEGIL olarak ekle ki sonraki taramalarda tekrar indirilmesin!
+                        jobs.append({
+                            "title": f"{inst_part}: Çeşitli İlanlar",
+                            "institution": inst_part,
+                            "url": pdf_url,
+                            "source": "Resmi Gazete",
+                            "summary": f"Resmî Gazete Çeşitli İlanlar (Elenen): {p_text} - {rej_reason}",
+                            "tags": ["UYGUN_DEGIL"],
+                            "published_date": d.strftime("%d.%m.%Y"),
+                            "requires_experience": 0,
+                            "experience_note": ""
+                        })
                         continue
                     
                     # Title: kurum adı + "Personel/Memur Alım İlanı" (sadece zaten içermiyorsa)
