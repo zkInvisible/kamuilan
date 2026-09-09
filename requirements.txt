@@ -1,0 +1,10 @@
+Flask==3.1.0
+APScheduler==3.10.4
+requests==2.32.3
+beautifulsoup4==4.12.3
+gunicorn==22.0.0
+python-dotenv==1.0.1
+urllib3==2.7.0
+pypdf==6.18.0
+opencv-python-headless>=4.8.0.76
+rapidocr-onnxruntime==1.4.4
