@@ -79,7 +79,15 @@ def guess_institution(title):
 
 def scrape_memurlar_net():
     base = "https://ilan.memurlar.net/"
-    content, _, _ = fetch(base)
+    try:
+        content, _, _ = fetch(base)
+    except requests.HTTPError as error:
+        # Some network edges block the short homepage route while serving the
+        # site's regular public listings page. Retry that page once on 403.
+        if error.response is None or error.response.status_code != 403:
+            raise
+        base = urljoin(base, "default.aspx?page=1")
+        content, _, _ = fetch(base)
     soup = html_soup(content)
     jobs, seen = [], set()
     for anchor in soup.select("a[href*='/ilan/']"):
