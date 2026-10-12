@@ -1,540 +1,315 @@
+"""KPSS Radar: a bounded background scanner and a small Flask dashboard."""
+import logging
 import os
 import threading
-import logging
-from datetime import datetime
-from flask import Flask, render_template, jsonify, request, Response, redirect
-import requests
-from apscheduler.schedulers.background import BackgroundScheduler
+import time
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
-
-import database as db
-import scraper
-import telegram_notifier
-
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("KPSS_APP")
+from flask import Flask, Response, jsonify, render_template, request
+import database as db
+import eligibility
+import scraper
+from deadlines import parse_deadline_info
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("KPSS_RADAR")
 app = Flask(__name__)
 
-# Konfigürasyon
-SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "60"))
-DAILY_NOTIFICATION_HOUR = int(os.environ.get("DAILY_NOTIFICATION_HOUR", "9"))
-DAILY_NOTIFICATION_MINUTE = int(os.environ.get("DAILY_NOTIFICATION_MINUTE", "0"))
-SEND_IMMEDIATE = os.environ.get("SEND_IMMEDIATE_NOTIFICATIONS", "false").lower() in ["true", "1", "yes"]
-
+SCAN_INTERVAL_MINUTES = max(60, int(os.environ.get("SCAN_INTERVAL_MINUTES", "480")))
+DETAIL_CACHE_MINUTES = max(15, int(os.environ.get("DETAIL_CACHE_MINUTES", "480")))
+MAX_DETAIL_REQUESTS = max(1, min(100, int(os.environ.get("MAX_DETAIL_REQUESTS", "60"))))
+DETAIL_RULE_VERSION = 5
+MANUAL_SCAN_COOLDOWN_SECONDS = 15 * 60
 scan_lock = threading.Lock()
 is_scanning = False
+scheduler = None
+last_manual_scan_at = 0.0
 
-def perform_scan_and_notify(is_manual: bool = False) -> dict:
-    """İlanları tarar, veritabanına kaydeder ve gerekirse bildirim gönderir."""
-    global is_scanning
-    if not scan_lock.acquire(blocking=False):
-        logger.warning("Tarama işlemi zaten devam ediyor, yeni istek atlandı.")
-        return {"status": "busy", "message": "Zaten aktif bir tarama devam ediyor."}
 
-    is_scanning = True
-    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    new_jobs = []
-    total_scraped = 0
-    error_msg = ""
+class VerificationDeferred(Exception):
+    pass
 
+
+def cache_age(detail):
     try:
-        logger.info("=== Otomatik İlan Taraması Başlatıldı ===")
-        scraped_jobs, counts = scraper.run_all_scrapers()
-        total_scraped = len(scraped_jobs)
+        fetched = datetime.fromisoformat(detail.get("_fetched_at", ""))
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - fetched).total_seconds()
+    except (ValueError, TypeError):
+        return float("inf")
 
-        for job in scraped_jobs:
+
+def cache_fresh(detail):
+    return bool(detail and detail.get("_rules_version") == DETAIL_RULE_VERSION and cache_age(detail) < DETAIL_CACHE_MINUTES * 60)
+
+
+def is_profile_ineligible(job):
+    return eligibility.prefilter(job.get("title", ""), job.get("summary", ""))
+
+
+def get_verified_job_detail(job_id, budget=None):
+    job = db.get_job_by_id(job_id)
+    if not job:
+        raise ValueError("İlan bulunamadı")
+    cached = job.get("detail_cache") or {}
+    from_cache = cache_fresh(cached)
+    if from_cache:
+        detail = dict(cached)
+        if scraper.is_sbb_url(job["url"]) and detail.get("document_url"):
+            detail["document_url"] = job["url"]
+    else:
+        if budget is not None:
+            with budget["lock"]:
+                if budget["remaining"] <= 0:
+                    raise VerificationDeferred()
+                budget["remaining"] -= 1
+        detail = scraper.fetch_job_detail(job)
+        detail["_fetched_at"] = db.now_iso()
+    analysis = eligibility.assess(detail.get("full_text", ""), detail.get("structured_rows", []),
+                                  detail.get("general_text"), job["title"])
+    detail.update(analysis)
+    detail["_rules_version"] = DETAIL_RULE_VERSION
+    detail["deadline_info"] = parse_deadline_info(job.get("published_date", ""),
+        summary=job.get("summary", "") + "\n" + detail.get("full_text", ""))
+    positions = detail.get("eligible_positions", [])
+    detail["eligible_quota"] = sum(row.get("quota") or 0 for row in positions) if positions and all(row.get("quota") is not None for row in positions) else None
+    detail["candidate_advice"] = (
+        "2026 KPSS P3, en fazla 78 taban puan ve diploma kontrolü geçen kadrolar aşağıda. Diğer özel şartları da kontrol et."
+        if detail["is_suitable"] else detail["reason"]
+    )
+    normalized_text = eligibility.fold(detail.get("general_text") or detail.get("full_text", ""))
+    detail["employment_type"] = "4/B sözleşmeli" if "4/b" in normalized_text else "KİT sözleşmeli" if "399" in normalized_text else "Kadrolu memur" if "657" in normalized_text else "İstihdam türünü resmî ilandan kontrol et"
+    selected_text = " ".join(row.get("title", "") + " " + row.get("qualification", "") for row in positions)
+    tags = scraper.classify_job(job["title"], job["institution"], full_text=selected_text)
+    if not detail["is_suitable"]:
+        tags.append("UYGUN_DEGIL" if detail["profile_verified"] else "DOGRULANMADI")
+    db.save_detail(job_id, detail, tags)
+    return detail, from_cache
+
+
+def verify_scanned_job(item, budget):
+    job_id, is_new = item
+    try:
+        detail, from_cache = get_verified_job_detail(job_id, budget)
+        if not from_cache:
+            time.sleep(0.25)
+        return job_id, is_new, "eligible" if detail["is_suitable"] else "excluded"
+    except VerificationDeferred:
+        return job_id, is_new, "deferred"
+    except Exception as error:
+        logger.warning("İlan doğrulanamadı (id=%s): %s", job_id, error)
+        # Preserve the last document for diagnostics; stale results are hidden by the API.
+        job = db.get_job_by_id(job_id)
+        detail = dict(job.get("detail_cache") or {})
+        detail["_last_error"] = str(error)[:300]
+        detail["_attempted_at"] = db.now_iso()
+        db.save_detail(job_id, detail, ["DOGRULANMADI"])
+        return job_id, is_new, "error"
+
+
+def _scan_worker():
+    global is_scanning
+    started = db.now_iso()
+    total, inserted = 0, 0
+    reports = {}
+    try:
+        scraped, reports = scraper.run_all_scrapers()
+        total = len(scraped)
+        candidates = {}
+        excluded = 0
+        for job in scraped:
+            if is_profile_ineligible(job) or parse_deadline_info(job.get("published_date", ""), summary=job.get("summary", ""))["badge_type"] == "expired":
+                excluded += 1
+                continue
+            job["tags"] = ["DOGRULANMADI"]
             job_id, is_new = db.insert_job(job)
-            if is_new:
-                job["id"] = job_id
-                new_jobs.append(job)
-
-        finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        db.log_scan(
-            started_at=started_at,
-            finished_at=finished_at,
-            total_scraped=total_scraped,
-            new_inserted=len(new_jobs),
-            status="SUCCESS",
-            error_message=""
-        )
-        logger.info(f"Tarama tamamlandı. Toplam taranan: {total_scraped}, Yeni eklenen: {len(new_jobs)}")
-
-        # Bildirim Mantığı: Yalnızca günde 1 kez (scheduled_daily_digest) toplu bülten gönderilir.
-        # Anlık veya manuel buton taramalarında Telegram mesajı atılmaz.
-        if new_jobs and SEND_IMMEDIATE:
-            logger.info(f"{len(new_jobs)} yeni ilan için Telegram bildirimi gönderiliyor (SEND_IMMEDIATE aktif)...")
-            success, sent_count = telegram_notifier.send_daily_digest(new_jobs)
-            if success:
-                db.mark_as_notified([j["id"] for j in new_jobs if j.get("id")])
-
-        return {
-            "status": "success",
-            "total_scraped": total_scraped,
-            "new_jobs_count": len(new_jobs),
-            "sources": counts
-        }
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Tarama sırasında hata oluştu: {e}", exc_info=True)
-        finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        db.log_scan(
-            started_at=started_at,
-            finished_at=finished_at,
-            total_scraped=total_scraped,
-            new_inserted=len(new_jobs),
-            status="ERROR",
-            error_message=error_msg
-        )
-        return {"status": "error", "message": error_msg}
+            candidates[job_id] = candidates.get(job_id, False) or is_new
+        # Refresh known matches first, then unread/old documents; no province preference.
+        def verification_priority(item):
+            detail = db.get_job_by_id(item[0]).get("detail_cache") or {}
+            return (not detail.get("is_suitable", False), -cache_age(detail))
+        candidates = sorted(candidates.items(), key=verification_priority)
+        budget = {"remaining": MAX_DETAIL_REQUESTS, "lock": threading.Lock()}
+        outcomes = {"eligible": 0, "excluded": excluded, "deferred": 0, "error": 0}
+        for item in candidates:
+            job_id, is_new, outcome = verify_scanned_job(item, budget)
+            outcomes[outcome] += 1
+            if is_new and outcome == "eligible":
+                inserted += 1
+        expired_deleted = db.delete_expired_jobs()
+        failures = sum(report["status"] == "error" for report in reports.values())
+        partial = any(report["status"] == "partial" for report in reports.values())
+        status = "ERROR" if failures == len(reports) else "PARTIAL" if failures or partial or outcomes["error"] or outcomes["deferred"] else "SUCCESS"
+        reports["__verification__"] = dict(outcomes, expired_deleted=expired_deleted)
+        db.log_scan(started, total, inserted, status, reports)
+        logger.info("Tarama: %s ilan, %s uygun, %s ertelenen; %s", total, outcomes["eligible"], outcomes["deferred"], status)
+        return {"status": status.lower(), "total_scraped": total, "new_jobs_count": inserted, "verification": reports["__verification__"], "sources": reports}
+    except Exception as error:
+        logger.exception("Tarama tamamlanamadı")
+        db.log_scan(started, total, inserted, "ERROR", reports, str(error)[:500])
+        return {"status": "error", "message": str(error)}
     finally:
         is_scanning = False
         scan_lock.release()
 
-def scheduled_daily_digest():
-    """Her gün belirlenen saatte (günde 1 kez) henüz bildirilmemiş yeni ve süresi geçerli ilanları topluca Telegram'a atar."""
-    logger.info("=== Günlük Toplu Telegram Bülteni Görevi Tetiklendi ===")
-    unnotified_jobs = db.get_unnotified_jobs()
-    if not unnotified_jobs:
-        logger.info("Bildirilecek bekleyen yeni ilan bulunamadı.")
-        return
 
-    # Süresi geçmiş veya tecrübe şartı arayanları bültenden ele ve işaretle
-    valid_jobs = []
-    expired_ids = []
-    for j in unnotified_jobs:
-        date_raw = j.get("published_date", "") or j.get("summary", "")
-        info = scraper.parse_deadline_info(date_raw, source=j.get("source", ""), summary=j.get("summary", ""))
-        if info.get("badge_type") == "expired":
-            if j.get("id"):
-                expired_ids.append(j["id"])
+def perform_scan():
+    global is_scanning
+    if not scan_lock.acquire(blocking=False):
+        return {"status": "busy"}
+    is_scanning = True
+    return _scan_worker()
+
+
+def start_scan():
+    global is_scanning
+    if not scan_lock.acquire(blocking=False):
+        return False
+    is_scanning = True
+    threading.Thread(target=_scan_worker, daemon=True, name="SourceScan").start()
+    return True
+
+
+def start_manual_scan():
+    global is_scanning, last_manual_scan_at
+    if not scan_lock.acquire(blocking=False):
+        return {"status": "busy"}
+    now = time.monotonic()
+    remaining = MANUAL_SCAN_COOLDOWN_SECONDS - (now - last_manual_scan_at)
+    if remaining > 0:
+        scan_lock.release()
+        return {"status": "cooldown", "retry_after_seconds": int(remaining)}
+    last_manual_scan_at = now
+    is_scanning = True
+    threading.Thread(target=_scan_worker, daemon=True, name="ManualSourceScan").start()
+    return {"status": "started"}
+
+
+def visible_jobs():
+    jobs, seen = [], {}
+    for job in db.get_jobs():
+        detail = job.pop("detail_cache", None) or {}
+        if not cache_fresh(detail) or not detail.get("is_suitable") or not detail.get("profile_verified"):
             continue
-        if j.get("requires_experience") == 1 or "TECRUBE_SARTI" in j.get("tags", []):
-            if j.get("id"):
-                expired_ids.append(j["id"])
+        if any(tag in job["tags"] for tag in ("UYGUN_DEGIL", "DOGRULANMADI")):
             continue
-        valid_jobs.append(j)
+        positions = detail.get("eligible_positions") or []
+        if not positions or any(row.get("score_type") != 3 or not isinstance(row.get("minimum_score"), (int, float)) or row["minimum_score"] > 78 or not eligibility.accepts_degree(row.get("qualification", "")) or eligibility.exclusion(row.get("title", "") + " " + row.get("qualification", "")) for row in positions):
+            continue
+        if detail.get("required_kpss_years") and eligibility.PROFILE_KPSS_YEAR not in detail["required_kpss_years"]:
+            continue
+        stored_deadline = detail.get("deadline_info") or {}
+        info = parse_deadline_info("Son başvuru: " + stored_deadline["deadline_iso"]) if stored_deadline.get("confidence") == "explicit" and stored_deadline.get("deadline_iso") else parse_deadline_info(
+            job.get("published_date", ""), summary=job.get("summary", ""))
+        if info["badge_type"] == "expired":
+            continue
+        identity = detail.get("document_hash") or job["signature"]
+        if identity in seen:
+            primary = seen[identity]
+            if job["source"] not in primary["all_sources"]:
+                primary["all_sources"].append(job["source"])
+            continue
+        job.update({"deadline_info": info, "eligible_positions": detail.get("eligible_positions", []),
+                    "eligible_quota": detail.get("eligible_quota"), "extra_conditions": detail.get("extra_conditions", []),
+                    "required_kpss_years": detail.get("required_kpss_years", []),
+                    "all_sources": [job["source"]], "web_url": job["url"],
+                    "pdf_url": f"/api/jobs/{job['id']}/pdf" if detail.get("document_url") else None})
+        seen[identity] = job
+        jobs.append(job)
+    return jobs
 
-    if expired_ids:
-        db.mark_as_notified(expired_ids)
 
-    if not valid_jobs:
-        logger.info("Aktif yeni ilan kalmadı, bülten gönderilmedi.")
-        return
-
-    logger.info(f"{len(valid_jobs)} aktif ilan için günlük toplu Telegram bülteni gönderiliyor...")
-    success, count = telegram_notifier.send_daily_digest(valid_jobs)
-    if success:
-        db.mark_as_notified([j["id"] for j in valid_jobs if j.get("id")])
-        logger.info(f"{count} adet ilan günlük toplu bülten ile bildirildi ve işaretlendi.")
-
-# --- FLASK WEB ROTLARI ---
-
-@app.route("/")
+@app.get("/")
 def index():
-    """Ana sayfa dashboard arayüzü."""
     return render_template("index.html")
 
-@app.route("/health")
-@app.route("/ping")
+
+@app.get("/health")
+@app.get("/ping")
 def health():
-    """Render.com ve UptimeRobot için lightweight 7/24 sağlık kontrolü."""
-    return jsonify({
-        "status": "healthy",
-        "service": "kpss-radar",
-        "timestamp": datetime.now().isoformat(),
-        "is_scanning": is_scanning
-    })
+    return jsonify(status="healthy", service="kpss-radar", is_scanning=is_scanning)
 
-@app.route("/api/jobs")
+
+@app.get("/api/jobs")
 def api_get_jobs():
-    """Filtreli, sıralı ve arama destekli ilan listesi (Süresi dolmuşlar elenir)."""
-    tag = request.args.get("tag", "ALL")
-    search = request.args.get("search", "")
-    source = request.args.get("source", "ALL")
-    sort_by = request.args.get("sort_by", "newest")
-    only_favs = request.args.get("only_favorites", "false").lower() in ["true", "1", "yes"]
-    include_expired = request.args.get("include_expired", "false").lower() in ["true", "1", "yes"]
-    include_experience = request.args.get("include_experience", "false").lower() in ["true", "1", "yes"]
-    limit = int(request.args.get("limit", 400))
-    offset = int(request.args.get("offset", 0))
-
-    jobs = db.get_jobs(
-        tag=tag,
-        search=search,
-        source=source,
-        only_favorites=only_favs,
-        sort_by=sort_by,
-        limit=limit,
-        offset=offset,
-        exclude_experience=not include_experience
-    )
-    
-    # Her ilana son başvuru geri sayım bilgisini ekle, süresi dolmuşları ve tecrübe şartlıları ayıkla
-    active_jobs = []
-    for j in jobs:
-        # Tecrübe şartı kontrolü (Yeni mezun için kesin eleme)
-        if not include_experience and (j.get("requires_experience") == 1 or "TECRUBE_SARTI" in j.get("tags", [])):
-            continue
-
-        # Adaya uygun olmayan ilanları ana listeden ele
-        if tag.upper() != "UYGUN_DEGIL" and "UYGUN_DEGIL" in j.get("tags", []):
-            continue
-
-        date_raw = j.get("published_date", "") or j.get("summary", "")
-        info = scraper.parse_deadline_info(date_raw, source=j.get("source", ""), summary=j.get("summary", ""))
-        j["deadline_info"] = info
-
-        # Kullanıcı talebi: Süresi dolmuş ilanlar ana ekranda gösterilmez
-        if not include_expired and info.get("badge_type") == "expired":
-            continue
-        active_jobs.append(j)
-
-    stats = db.get_stats()
-
-    return jsonify({
-        "status": "success",
-        "jobs": active_jobs,
-        "count": len(active_jobs),
-        "stats": stats
-    })
-
-@app.route("/api/jobs/favorite", methods=["POST"])
-def api_toggle_favorite():
-    """İlanın favori durumunu değiştirir."""
-    data = request.get_json(silent=True) or {}
-    job_id = data.get("job_id") or request.form.get("job_id")
-    if not job_id:
-        return jsonify({"status": "error", "message": "job_id belirtilmedi"}), 400
-
     try:
-        new_state = db.toggle_favorite(int(job_id))
-        stats = db.get_stats()
-        return jsonify({
-            "status": "success",
-            "is_favorite": new_state,
-            "favorites_count": stats["favorites_count"]
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        limit = min(400, max(1, int(request.args.get("limit", 400))))
+    except ValueError:
+        return jsonify(status="error", message="Geçersiz ilan sayısı"), 400
+    jobs = visible_jobs()
+    search, source, tag = request.args.get("search", "").strip(), request.args.get("source", ""), request.args.get("tag", "")
+    if search:
+        needle = eligibility.fold(search)
+        jobs = [job for job in jobs if needle in eligibility.fold(f"{job['title']} {job['institution']} {job['summary']}")]
+    if source and source.upper() != "ALL":
+        jobs = [job for job in jobs if source in job["all_sources"]]
+    if tag and tag.upper() != "ALL":
+        jobs = [job for job in jobs if tag in job["tags"]]
+    return jsonify(status="success", jobs=jobs[:limit], count=len(jobs[:limit]), categories=eligibility.TAG_LABELS,
+                   profile={"kpss_type": 3, "score": 78, "year": int(eligibility.PROFILE_KPSS_YEAR)},
+                   stats={"total_jobs": len(jobs), "last_scan": db.last_scan()})
 
-@app.route("/api/jobs/<int:job_id>/detail")
-def api_get_job_detail(job_id: int):
-    """
-    Belirli bir ilanın detaylı analizini, alınan pozisyonları, kontenjan sayısını,
-    istihdam türünü, varsa resmi kadro tablosu görselini ve başvuru şartlarını döner.
-    Performans için veritabanında önbelleğe (detail_cache) alır.
-    """
-    job = db.get_job_by_id(job_id)
-    if not job:
-        return jsonify({"status": "error", "message": "İlan bulunamadı"}), 404
 
-    # 1. Önce veritabanı önbelleğine bak
-    cached = db.get_job_detail_cache(job_id)
-    if cached:
-        # Önbellekteki metin ve kadroları güncel kural setiyle aday uygunluğuna göre anında doğrula
-        paragraphs = cached.get("paragraphs", [])
-        cadres = cached.get("cadres", [])
-        content_txt = cached.get("content", "") or cached.get("full_text", "")
-        full_text = " ".join(paragraphs) + " " + " ".join(cadres) + " " + content_txt
-        
-        is_suit, reason_code, reason_desc = scraper.evaluate_candidate_suitability(
-            title=job["title"],
-            text=full_text,
-            institution=job.get("institution", ""),
-            source=job.get("source", "")
-        )
-        if not is_suit:
-            cached["is_suitable"] = False
-            cached["candidate_advice"] = f"❌ ADAYA UYGUN DEĞİL: {reason_desc}"
-            cached["advice_badge"] = "target_incompatible"
-            db.update_job_tags(job_id, ["UYGUN_DEGIL"])
-            db.update_job_detail_cache(job_id, cached)
-        elif "MAKINE_MUHENDIS" in job.get("tags", []) and cached.get("advice_badge") in ["target_general", "target_engineer"]:
-            cached["candidate_advice"] = "⚙️ DİPLOMA BİREBİR EŞLEŞMESİ: İlanda doğrudan Makine Mühendisliği / Mekatronik lisans diploması aranmaktadır. Tecrübe şartı aranmamaktadır; 80 puanınız güçlü bir puandır."
-            cached["advice_badge"] = "target_match"
-            db.update_job_detail_cache(job_id, cached)
-        return jsonify({"status": "success", "detail": cached, "from_cache": True})
-
-    # 2. Önbellekte yoksa detayları çek ve analiz et
+@app.get("/api/jobs/<int:job_id>/detail")
+def api_get_job_detail(job_id):
+    if not db.get_job_by_id(job_id):
+        return jsonify(status="error", message="İlan bulunamadı"), 404
     try:
-        detail_data = scraper.fetch_and_analyze_job_detail(
-            url=job["url"],
-            source=job["source"],
-            title=job["title"],
-            institution=job["institution"],
-            tags=job.get("tags", [])
-        )
-        # Aday uygunluk durumunu ve etiketlerini veritabanında senkronize et
-        paragraphs = detail_data.get("paragraphs", [])
-        cadres = detail_data.get("cadres", [])
-        full_text = " ".join(paragraphs) + " " + " ".join(cadres)
-        
-        new_tags = scraper.classify_job(
-            title=job["title"],
-            institution=job["institution"],
-            summary=job.get("summary", ""),
-            full_text=full_text,
-            source=job.get("source", "")
-        )
-        
-        is_exp = bool(detail_data.get("requires_experience")) or ("TECRUBE_SARTI" in new_tags)
-        exp_note = detail_data.get("experience_note", "")
-        if is_exp and "TECRUBE_SARTI" not in new_tags:
-            new_tags.append("TECRUBE_SARTI")
-            
-        if not detail_data.get("is_suitable", True) and "UYGUN_DEGIL" not in new_tags:
-            new_tags.append("UYGUN_DEGIL")
-            
-        db.update_job_tags(job_id, new_tags)
-        db.update_job_experience_status(job_id, is_exp, exp_note)
+        detail, from_cache = get_verified_job_detail(job_id)
+        return jsonify(status="success", detail=detail, from_cache=from_cache)
+    except Exception as error:
+        logger.warning("Detay okunamadı (id=%s): %s", job_id, error)
+        return jsonify(status="error", message="Kaynak belge şu anda okunamıyor. Resmî ilanı açabilirsin."), 502
 
-        # Önbelleğe kaydet
-        db.update_job_detail_cache(job_id, detail_data)
-        return jsonify({"status": "success", "detail": detail_data, "from_cache": False})
-    except Exception as e:
-        logger.error(f"Detay çekme hatası (job_id={job_id}): {e}")
-        # Hata durumunda temel analizle fallback dön
-        is_exp_fb, exp_note_fb = scraper.check_experience_requirement(f"{job['title']} {job.get('summary', '')}")
-        fallback_detail = {
-            "title": job["title"],
-            "institution": job["institution"],
-            "source": job["source"],
-            "url": job["url"],
-            "quota": "Kontenjan Belirtilmedi",
-            "cadres": ["📋 İlanda Belirtilen Pozisyonlar"],
-            "employment_type": "Kamu Personeli Alımı",
-            "evaluation_method": "KPSS Puan Sıralaması",
-            "kpss_requirement": "KPSS P3 (Lisans)",
-            "candidate_advice": "Tecrübe şartı aranmamaktadır (Yeni mezun başvurabilir)." if not is_exp_fb else f"❌ Tecrübe şartı tespit edildi ({exp_note_fb}).",
-            "table_images": [],
-            "paragraphs": [job.get("summary", "")],
-            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "is_fresh_grad": not is_exp_fb,
-            "requires_experience": 1 if is_exp_fb else 0,
-            "experience_note": exp_note_fb if is_exp_fb else "Tecrübe şartı aranmamaktadır (Yeni mezunlar başvurabilir, staj yeterlidir)."
-        }
-        return jsonify({"status": "success", "detail": fallback_detail, "from_cache": False})
 
-@app.route("/api/jobs/<int:job_id>/pdf")
-def api_view_job_pdf(job_id: int):
-    """
-    Kamu İlan (SBB) ve diğer PDF ilanlarını resmi sunucunun Referer korumasını
-    aşarak doğrudan tarayıcıda açmak üzere proxy/stream eder.
-    """
+@app.get("/api/jobs/<int:job_id>/pdf")
+def api_view_job_pdf(job_id):
     job = db.get_job_by_id(job_id)
     if not job:
         return "İlan bulunamadı", 404
-        
-    url = job.get("url", "")
-    if not url:
-        return "İlan bağlantısı mevcut değil", 404
+    detail = job.get("detail_cache") or {}
+    document_url = detail.get("document_url")
+    if not document_url:
+        return "Bu ilan için doğrulanmış PDF bağlantısı bulunamadı", 404
+    try:
+        return Response(scraper.pdf_bytes(document_url), content_type="application/pdf",
+                        headers={"Content-Disposition": "inline; filename=kamu_ilan.pdf", "Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"})
+    except Exception:
+        return render_template("document_error.html", message="Kaynak geçerli bir PDF sunmadı.", source_url=job["url"]), 502
 
-    # Eğer kamuilan.sbb.gov.tr ilanı ise, SBB'nin talep ettiği Referer başlığıyla çek
-    if "kamuilan.sbb.gov.tr" in url.lower():
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Referer": "https://kamuilan.sbb.gov.tr/",
-                "Accept": "application/pdf,application/xhtml+xml,text/html;q=0.9,*/*;q=0.8"
-            }
-            resp = requests.get(url, headers=headers, verify=False, timeout=25, stream=True)
-            
-            # Content-Disposition başlığından orijinal dosya adını al
-            content_disp = resp.headers.get("Content-Disposition", "")
-            filename = "kamu_ilan_resmi.pdf"
-            if "filename=" in content_disp:
-                fname_part = content_disp.split("filename=")[-1].strip('"\'; ')
-                if fname_part:
-                    filename = fname_part
-                    
-            content_type = resp.headers.get("Content-Type", "application/pdf")
-            
-            def generate():
-                for chunk in resp.iter_content(chunk_size=16384):
-                    if chunk:
-                        yield chunk
-                        
-            return Response(
-                generate(),
-                content_type=content_type,
-                headers={
-                    "Content-Disposition": f"inline; filename*=UTF-8''{filename}",
-                    "Cache-Control": "public, max-age=3600"
-                }
-            )
-        except Exception as e:
-            logger.error(f"SBB PDF proxy hatası (job_id={job_id}, url={url}): {e}")
-            return redirect(url)
-            
-    elif "iskur.gov.tr" in url.lower() and ".pdf" in url.lower():
-        try:
-            import urllib.parse
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Referer": "https://www.iskur.gov.tr/",
-                "Accept": "application/pdf,application/xhtml+xml,text/html;q=0.9,*/*;q=0.8"
-            }
-            parts = urllib.parse.urlsplit(url)
-            safe_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, urllib.parse.quote(parts.path), parts.query, parts.fragment))
-            resp = requests.get(safe_url, headers=headers, timeout=25, stream=True)
-            return Response(
-                resp.iter_content(chunk_size=16384),
-                content_type="application/pdf",
-                headers={
-                    "Content-Disposition": "inline; filename=iskur_ilan.pdf",
-                    "Cache-Control": "public, max-age=3600"
-                }
-            )
-        except Exception as e:
-            logger.error(f"İŞKUR PDF proxy hatası (job_id={job_id}, url={url}): {e}")
-            return redirect(url)
-            
-    # Diğer ilanlar için orijinal linke yönlendir
-    return redirect(url)
 
-@app.route("/api/view-pdf")
-def api_view_pdf_by_url():
-    """URL parametresi ile verilen SBB PDF linkini stream eder."""
-    url = request.args.get("url", "")
-    if not url:
-        return "URL belirtilmedi", 400
-        
-    if "kamuilan.sbb.gov.tr" in url.lower():
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Referer": "https://kamuilan.sbb.gov.tr/",
-            }
-            resp = requests.get(url, headers=headers, verify=False, timeout=25, stream=True)
-            return Response(
-                resp.iter_content(chunk_size=16384),
-                content_type=resp.headers.get("Content-Type", "application/pdf"),
-                headers={"Content-Disposition": "inline; filename=kamu_ilan.pdf"}
-            )
-        except Exception as e:
-            logger.error(f"SBB PDF stream hatası ({url}): {e}")
-            return redirect(url)
-            
-    return redirect(url)
-
-@app.route("/api/export-csv")
-def api_export_csv():
-    """Tüm ilanları CSV dosyası olarak indirir."""
-    csv_data = db.export_jobs_to_csv()
-    filename = f"kpss_ilanlar_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    return Response(
-        csv_data,
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
-    )
-
-@app.route("/api/stats")
-def api_get_stats():
-    """Sistem ve ilan istatistikleri."""
-    stats = db.get_stats()
-    return jsonify({"status": "success", "stats": stats})
-
-@app.route("/api/scan", methods=["POST"])
-def api_manual_scan():
-    """Kullanıcının web panelinden tetiklediği manuel tarama (Arka plan asenkron thread)."""
-    global is_scanning
-    if is_scanning:
-        return jsonify({
-            "status": "busy",
-            "message": "Tarama işlemi şu anda devam ediyor. Lütfen tamamlanmasını bekleyin."
-        })
-
-    thread = threading.Thread(target=perform_scan_and_notify, kwargs={"is_manual": True}, daemon=True)
-    thread.start()
-    return jsonify({
-        "status": "started",
-        "message": "Tarama arka planda başlatıldı."
-    })
-
-@app.route("/api/scan/status")
+@app.get("/api/scan/status")
 def api_scan_status():
-    """Taramanın güncel durumunu ve son tarama kaydını döner."""
-    stats = db.get_stats()
-    return jsonify({
-        "status": "success",
-        "is_scanning": is_scanning,
-        "last_scan": stats.get("last_scan")
-    })
+    last = db.last_scan()
+    if last:
+        last["verification"] = last.get("sources", {}).pop("__verification__", {})
+    return jsonify(status="success", is_scanning=is_scanning, last_scan=last)
 
-@app.route("/api/test-telegram", methods=["POST"])
-def api_test_telegram():
-    """Telegram test bildirimi devre dışı bırakıldı."""
-    return jsonify({
-        "status": "info",
-        "message": "Test bildirimleri devre dışı bırakılmıştır. İlanlar yalnızca günde 1 kez toplu bülten olarak iletilmektedir."
-    })
 
-@app.route("/api/send-digest", methods=["POST"])
-def api_trigger_digest():
-    """Bekleyen ilanlar için manuel günlük bülten tetikler."""
-    unnotified_jobs = db.get_unnotified_jobs()
-    if not unnotified_jobs:
-        return jsonify({"status": "info", "message": "Bildirilecek bekleyen yeni ilan bulunmuyor."})
+@app.post("/api/scan")
+def api_manual_scan():
+    return jsonify(start_manual_scan())
 
-    success, count = telegram_notifier.send_daily_digest(unnotified_jobs)
-    if success:
-        db.mark_as_notified([j["id"] for j in unnotified_jobs])
-        return jsonify({"status": "success", "message": f"{count} ilan Telegram'a iletildi."})
-    else:
-        return jsonify({"status": "error", "message": "Telegram mesajı gönderilemedi."})
-
-# --- ZAMANLAYICI VE BAŞLANGIÇ ---
 
 def start_scheduler():
-    scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(
-        perform_scan_and_notify,
-        "interval",
-        minutes=SCAN_INTERVAL_MINUTES,
-        id="periodic_job_scan",
-        replace_existing=True
-    )
-    scheduler.add_job(
-        scheduled_daily_digest,
-        "cron",
-        hour=DAILY_NOTIFICATION_HOUR,
-        minute=DAILY_NOTIFICATION_MINUTE,
-        id="daily_job_digest",
-        replace_existing=True
-    )
+    global scheduler
+    from apscheduler.schedulers.background import BackgroundScheduler
+    scheduler = BackgroundScheduler(timezone="Europe/Istanbul")
+    scheduler.add_job(perform_scan, "interval", minutes=SCAN_INTERVAL_MINUTES, max_instances=1, coalesce=True, id="source_scan")
     scheduler.start()
-    logger.info(f"APScheduler başlatıldı. Tarama periyodu: {SCAN_INTERVAL_MINUTES} dk, Günlük bülten: {DAILY_NOTIFICATION_HOUR:02d}:{DAILY_NOTIFICATION_MINUTE:02d}")
+    timer = threading.Timer(3, start_scan)
+    timer.daemon = True
+    timer.start()
 
-def check_initial_scan():
-    """Eğer sistem ilk kez ayağa kalktıysa ve veritabanında hiç ilan yoksa,
-    kullanıcı müdahalesi beklemeden arka planda ilk taramayı otonom olarak başlatır."""
-    def _initial_scan_worker():
-        import time
-        time.sleep(10)  # Sunucunun başlaması için 10 saniye bekle
-        try:
-            stats = db.get_stats()
-            if stats.get("total_jobs", 0) == 0:
-                logger.info("Veritabanı boş tespit edildi. İlk otonom tarama başlatılıyor...")
-                perform_scan_and_notify()
-        except Exception as e:
-            logger.error(f"İlk tarama kontrolü hatası: {e}")
 
-    threading.Thread(target=_initial_scan_worker, daemon=True, name="InitialScanThread").start()
-
-# Veritabanını ilklendir
 db.init_db()
-
-if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.environ.get("RUN_SCHEDULER", "true").lower() == "true":
+db.delete_expired_jobs()
+if os.environ.get("RUN_SCHEDULER", "true").lower() == "true":
     start_scheduler()
-    check_initial_scan()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    logger.info(f"KPSS Radar sunucusu başlatılıyor: http://127.0.0.1:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)

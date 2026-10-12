@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#14191f">
+  <title>KPSS Radar · Kamu ilan takibi</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}?v=3">
+  <script src="{{ url_for('static', filename='dashboard.js') }}?v=3" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">K</span><div>KPSS Radar<span class="brand-caption">Kamu ilan takibi</span></div></div>
+    <div class="topbar-right"><span class="scan-status" id="scanStatus" role="status"><span class="status-dot"></span> Sistem kontrol ediliyor</span><button class="btn" id="scan">↻ İlanları güncelle</button></div>
+  </header>
+  <div class="layout">
+    <aside class="sidebar" aria-label="İlan filtreleri">
+      <section class="profile">
+        <div class="eyebrow">ADAY PROFİLİN</div>
+        <h2>Makine Mühendisi</h2>
+        <div class="profile-score"><strong>78</strong><span>2026 KPSS P3<small>Lisans puanı</small></span></div>
+        <div class="profile-chips"><span>Lisans mezunu</span><span>Yüksek lisans yok</span></div>
+        <p>P3 dışı puan türleri, 78 üzeri puan şartı, işçilik, özel kontenjanlar ve akademik kadrolar gizlenir.</p>
+      </section>
+      <div class="filter-heading"><h2>Kategoriler</h2><button class="text-btn" id="clearFilters">Sıfırla</button></div>
+      <div id="categories" class="categories"></div>
+      <details class="source-health"><summary>Kaynak durumu</summary><div id="sourceHealth">İlk tarama bekleniyor.</div></details>
+      <section class="sidebar-note"><span class="note-icon" aria-hidden="true">↻</span><div><strong>8 saatte bir güncellenir</strong><p>İlanları senin için tek ekranda toplar.</p><span id="lastScan">Son tarama kontrol ediliyor…</span></div></section>
+    </aside>
+    <main>
+      <div class="page-heading"><div class="eyebrow">İLAN PANOSU</div><h1>Kamu ilanların</h1><p>İlanları unvan, kurum, kaynak ve etiketlerle filtrele.</p></div>
+      <section class="stats" aria-label="İlan sayıları">
+        <button class="stat" data-stat="all"><span>Listelenen ilan</span><strong id="total">—</strong><small>Tüm kaynaklar</small></button>
+        <button class="stat" data-stat="engineer"><span>Mühendislik</span><strong id="engineer">—</strong><small>Makine Mühendisliği</small></button>
+        <button class="stat" data-stat="memur"><span>Genel memurluk</span><strong id="memur">—</strong><small>Lisans mezunlarına açık</small></button>
+      </section>
+      <section class="filter-panel" aria-label="Arama ve sıralama">
+        <label class="search"><span class="sr-only">İlan ara</span><span class="search-icon" aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Unvan, kurum veya şehir ara…" autocomplete="off"></label>
+        <div class="filter-selects"><label><span>Kaynak</span><select id="source"><option value="all">Tüm kaynaklar</option></select></label><label><span>Sıralama</span><select id="sort"><option value="newest">En yeni eklenen</option><option value="deadline">Son başvuru yakın</option><option value="title">Unvan A → Z</option></select></label></div>
+      </section>
+      <div class="active-filters" id="activeFilters" aria-label="Seçili filtreler"></div>
+      <div class="results-heading"><h2>İlanlar <span id="resultCount">—</span></h2><span id="resultHint" role="status">Yükleniyor…</span></div>
+      <section class="grid" id="jobs" aria-label="İlan listesi"><div class="empty"><strong>İlanlar yükleniyor</strong><p>Kaynaklar kontrol ediliyor.</p></div></section>
+      <footer>Başvurmadan önce resmî ilandaki mezuniyet şartını ve son başvuru tarihini kontrol et.</footer>
+    </main>
+  </div>
+  <div class="modal-backdrop" id="backdrop">
+    <article class="modal" role="dialog" aria-modal="true" aria-labelledby="mTitle" tabindex="-1">
+      <div class="modal-head"><div><span class="source" id="mSource"></span><h2 id="mTitle"></h2><div class="institution" id="mInstitution"></div></div><button class="icon-btn close" id="close" aria-label="İlan detayını kapat">×</button></div>
+      <div class="job-tags" id="mTags"></div>
+      <div class="notice" id="mAdvice">Başvuru koşullarını resmî ilandan kontrol et.</div>
+      <div id="mPositions"></div>
+      <div id="mConditions"></div>
+      <div class="modal-content" id="mSummary"></div>
+      <div class="modal-actions"><a class="btn" id="mLink" target="_blank" rel="noopener">Resmî ilanı aç ↗</a></div>
+      <p class="detail-status" id="detailStatus" role="status"></p>
+    </article>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

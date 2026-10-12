@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: kpss-radar
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: SCAN_INTERVAL_MINUTES
+        value: "480"
+      - key: RUN_SCHEDULER
+        value: "true"
+      - key: DETAIL_CACHE_MINUTES
+        value: "480"
+      - key: MAX_DETAIL_REQUESTS
+        value: "60"
+      - key: PROFILE_KPSS_YEAR
+        value: "2026"
+      - key: DATABASE_PATH
+        value: /tmp/kpss-radar/jobs.db
+      - key: TZ
+        value: Europe/Istanbul
