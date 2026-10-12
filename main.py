@@ -104,6 +104,9 @@ def verify_scanned_job(item, budget):
         logger.warning("İlan doğrulanamadı (id=%s): %s", job_id, error)
         # Preserve the last document for diagnostics; stale results are hidden by the API.
         job = db.get_job_by_id(job_id)
+        if job is None:
+            logger.warning("Skipping missing job row during verification (id=%s)", job_id)
+            return job_id, is_new, "error"
         detail = dict(job.get("detail_cache") or {})
         detail["_last_error"] = str(error)[:300]
         detail["_attempted_at"] = db.now_iso()
